@@ -18,7 +18,7 @@ spec:
   - name: revision
     value: '{{revision}}'
   - name: output-image
-    value: REPLACEME:{{revision}}
+    value: quay.io/mkovarik/build-service:on-pr-{{revision}}
   - name: path-context
     value: .
   - name: dockerfile
