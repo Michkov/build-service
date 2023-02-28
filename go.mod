@@ -4,14 +4,14 @@ go 1.17
 
 require (
 	github.com/go-logr/logr v1.2.3
-	github.com/onsi/ginkgo v1.16.5
+	github.com/onsi/ginkgo/v2 v2.8.4
 	github.com/onsi/gomega v1.19.0
 	github.com/redhat-appstudio/application-service v0.0.0-20220429161414-fd5f11553e0f
 	github.com/tektoncd/pipeline v0.33.0
 	github.com/tektoncd/triggers v0.19.1
 	k8s.io/api v0.23.5
 	k8s.io/apimachinery v0.23.5
-	k8s.io/client-go v0.23.0
+	k8s.io/client-go/v6 v6.0.0
 	sigs.k8s.io/controller-runtime v0.11.0
 )
 
@@ -148,4 +148,4 @@ require (
 	sigs.k8s.io/yaml v1.3.0 // indirect
 )
 
-replace github.com/antlr/antlr4 => github.com/antlr/antlr4 v0.0.0-20211106181442-e4c1a74c66bd
+replace github.com/antlr/antlr4/v4 => github.com/antlr/antlr4 v4.11.1
