@@ -9,7 +9,7 @@ require (
 	github.com/redhat-appstudio/application-service v0.0.0-20220429161414-fd5f11553e0f
 	github.com/tektoncd/pipeline v0.33.0
 	github.com/tektoncd/triggers v0.19.1
-	k8s.io/api v0.23.5
+	k8s.io/api v0.26.1
 	k8s.io/apimachinery v0.23.5
 	k8s.io/client-go v0.23.0
 	sigs.k8s.io/controller-runtime v0.11.0
