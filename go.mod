@@ -148,4 +148,4 @@ require (
 	sigs.k8s.io/yaml v1.3.0 // indirect
 )
 
-replace github.com/antlr/antlr4 => github.com/antlr/antlr4 v0.0.0-20211106181442-e4c1a74c66bd
+replace github.com/antlr/antlr4/v4 => github.com/antlr/antlr4 v4.11.1
