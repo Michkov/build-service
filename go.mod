@@ -8,7 +8,7 @@ require (
 	github.com/onsi/gomega v1.19.0
 	github.com/redhat-appstudio/application-service v0.0.0-20220429161414-fd5f11553e0f
 	github.com/tektoncd/pipeline v0.33.0
-	github.com/tektoncd/triggers v0.19.1
+	github.com/tektoncd/triggers v0.22.2
 	k8s.io/api v0.23.5
 	k8s.io/apimachinery v0.23.5
 	k8s.io/client-go v0.23.0
