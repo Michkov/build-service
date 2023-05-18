@@ -29,6 +29,34 @@ components:
       deployment/memoryLimit: 100Mi
       deployment/memoryRequest: 10Mi
       deployment/container-port: 8081
+   - name: outerloop-deploy
+     kubernetes:
+      inlined: |-
+        kind: Deployment
+        apiVersion: apps/v1
+        metadata:
+          name: build-service
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: build-service
+          template:
+            metadata:
+              labels:
+                app: build-service
+            spec:
+              containers:
+                - name: build-service
+                  image: build-service:latest
+                  ports:
+                    - name: http
+                      containerPort: 8080
+                      protocol: TCP
+                  resources:
+                    limits:
+                      memory: "1024Mi"
+                      cpu: "500m"
 commands:
   - id: build-image
     apply:
