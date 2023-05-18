@@ -29,7 +29,6 @@ components:
       deployment/memoryLimit: 100Mi
       deployment/memoryRequest: 10Mi
       deployment/container-port: 8081
-   - name: outerloop-deploy
      kubernetes:
       inlined: |-
         kind: Deployment
