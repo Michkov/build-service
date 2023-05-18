@@ -29,8 +29,6 @@ components:
       deployment/memoryLimit: 100Mi
       deployment/memoryRequest: 10Mi
       deployment/container-port: 8081
-    kubernetes:
-      uri: outerloop-deploy.yaml
 commands:
   - id: build-image
     apply:
