@@ -1,5 +1,5 @@
 /*
-Copyright 2022.
+Copyright 2021-2023 Red Hat, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,39 +19,111 @@ package controllers
 import (
 	"context"
 	"fmt"
-	"net/url"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	"github.com/go-logr/logr"
-
-	appstudiov1alpha1 "github.com/redhat-appstudio/application-service/api/v1alpha1"
-	"github.com/redhat-appstudio/application-service/gitops"
+	"github.com/prometheus/client_golang/prometheus"
+	appstudiov1alpha1 "github.com/redhat-appstudio/application-api/api/v1alpha1"
+	"github.com/redhat-appstudio/build-service/pkg/boerrors"
+	l "github.com/redhat-appstudio/build-service/pkg/logs"
 )
 
 const (
-	InitialBuildAnnotationName = "com.redhat.appstudio/component-initial-build-happend"
+	InitialBuildAnnotationName = "appstudio.openshift.io/component-initial-build"
+
+	PaCProvisionFinalizer            = "pac.component.appstudio.openshift.io/finalizer"
+	ImageRegistrySecretLinkFinalizer = "image-registry-secret-sa-link.component.appstudio.openshift.io/finalizer"
+
+	PaCProvisionAnnotationName             = "appstudio.openshift.io/pac-provision"
+	PaCProvisionRequestedAnnotationValue   = "request"
+	PaCProvisionDoneAnnotationValue        = "done"
+	PaCProvisionErrorAnnotationValue       = "error"
+	PaCProvisionErrorDetailsAnnotationName = "appstudio.openshift.io/pac-provision-error"
+
+	ApplicationNameLabelName  = "appstudio.openshift.io/application"
+	ComponentNameLabelName    = "appstudio.openshift.io/component"
+	PartOfLabelName           = "app.kubernetes.io/part-of"
+	PartOfAppStudioLabelValue = "appstudio"
+
+	gitCommitShaAnnotationName    = "build.appstudio.redhat.com/commit_sha"
+	gitRepoAtShaAnnotationName    = "build.appstudio.openshift.io/repo"
+	gitTargetBranchAnnotationName = "build.appstudio.redhat.com/target_branch"
+
+	ImageRepoAnnotationName         = "image.redhat.com/image"
+	ImageRepoGenerateAnnotationName = "image.redhat.com/generate"
+	buildPipelineServiceAccountName = "appstudio-pipeline"
+
+	buildServiceNamespaceName         = "build-service"
+	buildPipelineSelectorResourceName = "build-pipeline-selector"
+
+	metricsNamespace = "redhat_appstudio"
+	metricsSubsystem = "buildservice"
 )
 
-// ComponentBuildReconciler watches AppStudio Component object in order to submit builds
+var (
+	initialBuildPipelineCreationTimeMetric      prometheus.Histogram
+	pipelinesAsCodeComponentProvisionTimeMetric prometheus.Histogram
+)
+
+func initMetrics() error {
+	buckets := getProvisionTimeMetricsBuckets()
+
+	initialBuildPipelineCreationTimeMetric = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Buckets:   buckets,
+		Name:      "initial_build_pipeline_creation_time",
+		Help:      "The time in seconds spent from the moment of Component creation till the initial build pipeline submission.",
+	})
+	pipelinesAsCodeComponentProvisionTimeMetric = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: metricsNamespace,
+		Subsystem: metricsSubsystem,
+		Buckets:   buckets,
+		Name:      "PaC_configuration_time",
+		Help:      "The time in seconds spent from the moment of Component creation till Pipelines-as-Code configuration done in the Component source repository.",
+	})
+
+	if err := metrics.Registry.Register(initialBuildPipelineCreationTimeMetric); err != nil {
+		return fmt.Errorf("failed to register the initial_build_pipeline_creation_time metric: %w", err)
+	}
+	if err := metrics.Registry.Register(pipelinesAsCodeComponentProvisionTimeMetric); err != nil {
+		return fmt.Errorf("failed to register the PaC_configuration_time metric: %w", err)
+	}
+
+	return nil
+}
+
+func getProvisionTimeMetricsBuckets() []float64 {
+	return []float64{5, 10, 15, 20, 30, 60, 120, 300}
+}
+
+// ComponentBuildReconciler watches AppStudio Component objects in order to
+// provision Pipelines as Code configuration for the Component or
+// submit initial builds and dependent resources if PaC is not configured.
 type ComponentBuildReconciler struct {
-	client.Client
-	Scheme *runtime.Scheme
-	Log    logr.Logger
+	Client        client.Client
+	Scheme        *runtime.Scheme
+	EventRecorder record.EventRecorder
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ComponentBuildReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := initMetrics(); err != nil {
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&appstudiov1alpha1.Component{}, builder.WithPredicates(predicate.Funcs{
 			CreateFunc: func(e event.CreateEvent) bool {
@@ -72,13 +144,18 @@ func (r *ComponentBuildReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 //+kubebuilder:rbac:groups=appstudio.redhat.com,resources=components,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=appstudio.redhat.com,resources=components/status,verbs=get;list;watch
+//+kubebuilder:rbac:groups=appstudio.redhat.com,resources=buildpipelineselectors,verbs=get;list;watch;create;update;patch
+//+kubebuilder:rbac:groups=tekton.dev,resources=pipelineruns,verbs=create
+//+kubebuilder:rbac:groups=pipelinesascode.tekton.dev,resources=repositories,verbs=get;list;watch;create;update;patch
+//+kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch
+//+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;patch;update
+//+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch
+//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+//+kubebuilder:rbac:groups=route.openshift.io,resources=routes,verbs=get;list;watch
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.11.0/pkg/reconcile
 func (r *ComponentBuildReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := r.Log.WithValues("ComponentInitialBuild", req.NamespacedName)
+	log := ctrllog.FromContext(ctx).WithName("ComponentOnboarding")
+	ctx = ctrllog.IntoContext(ctx, log)
 
 	// Fetch the Component instance
 	var component appstudiov1alpha1.Component
@@ -94,153 +171,227 @@ func (r *ComponentBuildReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	// Do not run any builds for any container-image components
-	if component.Spec.Source.ImageSource != nil && component.Spec.Source.ImageSource.ContainerImage != "" {
-		log.Info(fmt.Sprintf("Nothing to do for container image component: %v", req.NamespacedName))
+	if getContainerImageRepositoryForComponent(&component) == "" {
+		// Container image must be set. It's not possible to proceed without it.
+		log.Info("Waiting for ContainerImage to be set")
 		return ctrl.Result{}, nil
 	}
 
+	// Do not run any builds for any container-image components
+	if component.Spec.ContainerImage != "" && (component.Spec.Source.GitSource == nil || component.Spec.Source.GitSource.URL == "") {
+		log.Info("Nothing to do for container image component")
+		return ctrl.Result{}, nil
+	}
+
+	if !component.ObjectMeta.DeletionTimestamp.IsZero() {
+		// Deletion of the component is requested
+
+		if controllerutil.ContainsFinalizer(&component, ImageRegistrySecretLinkFinalizer) {
+			pipelineSA := &corev1.ServiceAccount{}
+			err := r.Client.Get(ctx, types.NamespacedName{Name: buildPipelineServiceAccountName, Namespace: req.Namespace}, pipelineSA)
+			if err != nil && !errors.IsNotFound(err) {
+				log.Error(err, fmt.Sprintf("Failed to read service account %s in namespace %s", buildPipelineServiceAccountName, req.Namespace), l.Action, l.ActionView)
+				return ctrl.Result{}, err
+			}
+			if err == nil { // If pipeline service account found, unlink the secret from it
+				if _, generatedImageRepoSecretName, err := getComponentImageRepoAndSecretNameFromImageAnnotation(&component); err == nil {
+					if _, err := r.unlinkSecretFromServiceAccount(ctx, generatedImageRepoSecretName, pipelineSA.Name, pipelineSA.Namespace); err != nil {
+						return ctrl.Result{}, err
+					}
+					// unlink secret also to old pipeline account, can be removed when default pipeline is switched to appstudio-pipeline
+					_, _ = r.unlinkSecretFromServiceAccount(ctx, generatedImageRepoSecretName, "pipeline", pipelineSA.Namespace)
+				}
+			}
+
+			if err := r.Client.Get(ctx, req.NamespacedName, &component); err != nil {
+				log.Error(err, "failed to get Component", l.Action, l.ActionView)
+				return ctrl.Result{}, err
+			}
+			controllerutil.RemoveFinalizer(&component, ImageRegistrySecretLinkFinalizer)
+			if err := r.Client.Update(ctx, &component); err != nil {
+				return ctrl.Result{}, err
+			}
+			log.Info("Image registry secret link finalizer removed", l.Action, l.ActionDelete)
+
+			// A new reconcile will be triggered because of the update above
+			return ctrl.Result{}, nil
+		}
+
+		if controllerutil.ContainsFinalizer(&component, PaCProvisionFinalizer) {
+			// In order not to block the deletion of the Component delete finalizer
+			// and then try to do clean up ignoring errors.
+
+			// Delete Pipelines as Code provision finalizer
+			controllerutil.RemoveFinalizer(&component, PaCProvisionFinalizer)
+			if err := r.Client.Update(ctx, &component); err != nil {
+				return ctrl.Result{}, err
+			}
+			log.Info("PaC finalizer removed", l.Action, l.ActionDelete)
+
+			// Try to clean up Pipelines as Code configuration
+			r.UndoPaCProvisionForComponent(ctx, &component)
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	// Ensure devfile model is set
 	if component.Status.Devfile == "" {
-		// The component has been just created.
-		// Component controller must set devfile model, wait for it.
-		log.Info(fmt.Sprintf("Waiting for devfile model in component: %v", req.NamespacedName))
+		// The Component has been just created.
+		// Component controller (from Application Service) must set devfile model, wait for it.
+		log.Info("Waiting for devfile model in component")
 		// Do not requeue as after model update a new update event will trigger a new reconcile
 		return ctrl.Result{}, nil
 	}
 
-	if len(component.Annotations) == 0 {
-		component.Annotations = make(map[string]string)
+	// Ensure pipeline service account exists
+	pipelineSA, err := r.ensurePipelineServiceAccount(ctx, component.Namespace)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-	if component.Annotations[InitialBuildAnnotationName] == "true" {
-		// Initial build have already happend, nothing to do.
+
+	// Link auto generated image registry secret in case of auto generated image repository is used.
+	isSwitchedImageRegistry := false
+	if !controllerutil.ContainsFinalizer(&component, ImageRegistrySecretLinkFinalizer) {
+		imageRepoGenerated, imageRepoSecretName, err := getComponentImageRepoAndSecretNameFromImageAnnotation(&component)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// Check if the generated image is used
+		if imageRepoGenerated != "" && (component.Spec.ContainerImage == "" || imageRepoGenerated == getContainerImageRepository(component.Spec.ContainerImage)) {
+			_, err = r.linkSecretToServiceAccount(ctx, imageRepoSecretName, pipelineSA.Name, pipelineSA.Namespace, true)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			// link secret also to old pipeline account, can be removed when default pipeline is switched to appstudio-pipeline
+			_, _ = r.linkSecretToServiceAccount(ctx, imageRepoSecretName, "pipeline", pipelineSA.Namespace, true)
+
+			// Ensure finalizer exists to clean up image registry secret link on component deletion
+			if component.ObjectMeta.DeletionTimestamp.IsZero() {
+				if !controllerutil.ContainsFinalizer(&component, ImageRegistrySecretLinkFinalizer) {
+					if err := r.Client.Get(ctx, req.NamespacedName, &component); err != nil {
+						log.Error(err, "failed to get Component", l.Action, l.ActionView)
+						return ctrl.Result{}, err
+					}
+					controllerutil.AddFinalizer(&component, ImageRegistrySecretLinkFinalizer)
+					if err := r.Client.Update(ctx, &component); err != nil {
+						return ctrl.Result{}, err
+					}
+					isSwitchedImageRegistry = true
+					log.Info("Image registry secret service account link finalizer added", l.Action, l.ActionUpdate)
+				}
+			}
+		}
+	}
+
+	// Check if Pipelines as Code workflow enabled
+	if val, exists := component.Annotations[PaCProvisionAnnotationName]; exists {
+		if val != PaCProvisionRequestedAnnotationValue && !isSwitchedImageRegistry {
+			if !(val == PaCProvisionDoneAnnotationValue || val == PaCProvisionErrorAnnotationValue) {
+				message := fmt.Sprintf(
+					"Unexpected value \"%s\" for \"%s\" annotation. Use \"%s\" value to do Pipeline as Code provision for the Component",
+					val, PaCProvisionAnnotationName, PaCProvisionRequestedAnnotationValue)
+				log.Info(message)
+			}
+			// Nothing to do
+			return ctrl.Result{}, nil
+		}
+
+		log.Info("Starting Pipelines as Code provision for the Component")
+
+		var pacAnnotationValue string
+		var pacPersistentErrorMessage string
+		err := r.ProvisionPaCForComponent(ctx, &component)
+		if err != nil {
+			if boErr, ok := err.(*boerrors.BuildOpError); ok && boErr.IsPersistent() {
+				log.Error(err, "Pipelines as Code provision for the Component failed")
+				pacAnnotationValue = PaCProvisionErrorAnnotationValue
+				pacPersistentErrorMessage = boErr.ShortError()
+			} else {
+				// transient error, retry
+				log.Error(err, "Pipelines as Code provision transient error")
+				return ctrl.Result{}, err
+			}
+		} else {
+			pacAnnotationValue = PaCProvisionDoneAnnotationValue
+			log.Info("Pipelines as Code provision for the Component finished successfully")
+		}
+
+		// Update component to show Pipeline as Code provision is done
+		if err := r.Client.Get(ctx, req.NamespacedName, &component); err != nil {
+			log.Error(err, "failed to get Component", l.Action, l.ActionView)
+			return ctrl.Result{}, err
+		}
+
+		// Update PaC annotation
+		if len(component.Annotations) == 0 {
+			component.Annotations = make(map[string]string)
+		}
+		component.Annotations[PaCProvisionAnnotationName] = pacAnnotationValue
+		if pacPersistentErrorMessage != "" {
+			component.Annotations[PaCProvisionErrorDetailsAnnotationName] = pacPersistentErrorMessage
+		} else {
+			delete(component.Annotations, PaCProvisionErrorDetailsAnnotationName)
+		}
+
+		// Add finalizer to clean up Pipelines as Code configuration on component deletion
+		if component.ObjectMeta.DeletionTimestamp.IsZero() {
+			if !controllerutil.ContainsFinalizer(&component, PaCProvisionFinalizer) {
+				controllerutil.AddFinalizer(&component, PaCProvisionFinalizer)
+			}
+		}
+
+		if err := r.Client.Update(ctx, &component); err != nil {
+			log.Error(err, "failed to add PaC finalizer to the Component", l.Action, l.ActionUpdate, l.Audit, "true")
+			return ctrl.Result{}, err
+		} else {
+			log.Info("PaC finalizer added", l.Action, l.ActionUpdate)
+		}
+
 		return ctrl.Result{}, nil
 	}
 
-	// Set initial build annotation to prevent next builds
-	component.Annotations[InitialBuildAnnotationName] = "true"
-	if err := r.Client.Update(ctx, &component); err != nil {
+	// Pipelines as Code workflow is not enabled, use plain builds.
+
+	// Reread component to avoid out of date state
+	if err := r.Client.Get(ctx, req.NamespacedName, &component); err != nil {
+		log.Error(err, "failed to get Component", l.Action, l.ActionView)
 		return ctrl.Result{}, err
 	}
 
-	if err := r.SubmitNewBuild(ctx, component); err != nil {
-		// Try to revert the annotation
+	// Check initial build annotation to know if any work should be done for the Component
+	if len(component.Annotations) == 0 {
+		component.Annotations = make(map[string]string)
+	}
+	if _, exists := component.Annotations[InitialBuildAnnotationName]; exists {
+		// Initial build have already happend, nothing to do.
+		return ctrl.Result{}, nil
+	}
+	// The initial build is needed for the Component
+
+	// Set initial build annotation to prevent next builds
+	component.Annotations[InitialBuildAnnotationName] = "processed"
+	if err := r.Client.Update(ctx, &component); err != nil {
+		log.Error(err, "failed to add initial build annotation to the Component", l.Action, l.ActionUpdate)
+		return ctrl.Result{}, err
+	}
+
+	if err := r.SubmitNewBuild(ctx, &component); err != nil {
+		// Try to revert the initial build annotation
 		if err := r.Client.Get(ctx, req.NamespacedName, &component); err == nil {
-			component.Annotations[InitialBuildAnnotationName] = "false"
-			if err := r.Client.Update(ctx, &component); err != nil {
-				log.Error(err, fmt.Sprintf("Failed to schedule initial build for component: %v", req.NamespacedName))
+			if len(component.Annotations) > 0 {
+				delete(component.Annotations, InitialBuildAnnotationName)
+				if err := r.Client.Update(ctx, &component); err != nil {
+					log.Error(err, "failed to reschedule initial build for the Component", l.Action, l.ActionUpdate)
+					return ctrl.Result{}, err
+				}
 			}
 		} else {
-			log.Error(err, fmt.Sprintf("Failed to schedule initial build for component: %v", req.NamespacedName))
+			log.Error(err, "failed to reschedule initial build for the Component", l.Action, l.ActionView)
+			return ctrl.Result{}, err
 		}
-
-		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
-}
-
-// SubmitNewBuild creates a new PipelineRun to build a new image for the given component.
-func (r *ComponentBuildReconciler) SubmitNewBuild(ctx context.Context, component appstudiov1alpha1.Component) error {
-	log := r.Log.WithValues("Namespace", component.Namespace, "Application", component.Spec.Application, "Component", component.Name)
-
-	// TODO delete this block which is workaround for delayed sync of pvc
-	workspaceStorage := gitops.GenerateCommonStorage(component, "appstudio")
-	existingPvc := &corev1.PersistentVolumeClaim{}
-	if err := r.Client.Get(ctx, types.NamespacedName{Name: workspaceStorage.Name, Namespace: workspaceStorage.Namespace}, existingPvc); err != nil {
-		if errors.IsNotFound(err) {
-			// Patch PVC size to 1 Gi, because default 10 Mi is not enough
-			workspaceStorage.Spec.Resources.Requests["storage"] = resource.MustParse("1Gi")
-			// Create PVC (Argo CD will patch it later)
-			err = r.Client.Create(ctx, workspaceStorage)
-			if err != nil {
-				log.Error(err, fmt.Sprintf("Unable to create common storage %v", workspaceStorage))
-				return err
-			}
-			log.Info(fmt.Sprintf("PV is now present : %v", workspaceStorage.Name))
-		} else {
-			log.Error(err, fmt.Sprintf("Unable to get common storage %v", workspaceStorage))
-			return err
-		}
-	}
-
-	gitSecretName := component.Spec.Secret
-	// Make the Secret ready for consumption by Tekton.
-	if gitSecretName != "" {
-		gitSecret := corev1.Secret{}
-		err := r.Client.Get(ctx, types.NamespacedName{Name: gitSecretName, Namespace: component.Namespace}, &gitSecret)
-		if err != nil {
-			log.Error(err, fmt.Sprintf("Secret %s is missing", gitSecretName))
-			return err
-		} else {
-			if gitSecret.Annotations == nil {
-				gitSecret.Annotations = map[string]string{}
-			}
-
-			gitHost, _ := getGitProvider(component.Spec.Source.GitSource.URL)
-
-			// Doesn't matter if it was present, we will always override.
-			gitSecret.Annotations["tekton.dev/git-0"] = gitHost
-			err = r.Client.Update(ctx, &gitSecret)
-			if err != nil {
-				log.Error(err, fmt.Sprintf("Secret %s update failed", gitSecretName))
-				return err
-			}
-		}
-	}
-
-	pipelinesServiceAccount := corev1.ServiceAccount{}
-	err := r.Client.Get(ctx, types.NamespacedName{Name: "pipeline", Namespace: component.Namespace}, &pipelinesServiceAccount)
-	if err != nil {
-		log.Error(err, fmt.Sprintf("OpenShift Pipelines-created Service account 'pipeline' is missing in namespace %s", component.Namespace))
-		return err
-	} else {
-		updateRequired := updateServiceAccountIfSecretNotLinked(gitSecretName, &pipelinesServiceAccount)
-		if updateRequired {
-			err = r.Client.Update(ctx, &pipelinesServiceAccount)
-			if err != nil {
-				log.Error(err, fmt.Sprintf("Unable to update pipeline service account %v", pipelinesServiceAccount))
-				return err
-			}
-			log.Info(fmt.Sprintf("Service Account updated %v", pipelinesServiceAccount))
-		}
-	}
-
-	initialBuild := gitops.GenerateInitialBuildPipelineRun(component)
-	err = controllerutil.SetOwnerReference(&component, &initialBuild, r.Scheme)
-	if err != nil {
-		log.Error(err, fmt.Sprintf("Unable to set owner reference for %v", initialBuild))
-	}
-	err = r.Client.Create(ctx, &initialBuild)
-	if err != nil {
-		log.Error(err, fmt.Sprintf("Unable to create the build PipelineRun %v", initialBuild))
-		return err
-	}
-	log.Info(fmt.Sprintf("Initial build pipeline created for component %s in %s namespace", component.Name, component.Namespace))
-
-	return nil
-}
-
-// getGitProvider takes a Git URL of the format https://github.com/foo/bar and returns https://github.com
-func getGitProvider(gitURL string) (string, error) {
-	u, err := url.Parse(gitURL)
-
-	// We really need the format of the string to be correct.
-	// We'll not do any autocorrection.
-	if err != nil || u.Scheme == "" {
-		return "", fmt.Errorf("failed to parse string into a URL: %v or scheme is empty", err)
-	}
-	return u.Scheme + "://" + u.Host, nil
-}
-
-func updateServiceAccountIfSecretNotLinked(gitSecretName string, serviceAccount *corev1.ServiceAccount) bool {
-	for _, credentialSecret := range serviceAccount.Secrets {
-		if credentialSecret.Name == gitSecretName {
-			// The secret is present in the service account, no updates needed
-			return false
-		}
-	}
-
-	// Add the secret to secret account and return that update is needed
-	serviceAccount.Secrets = append(serviceAccount.Secrets, corev1.ObjectReference{Name: gitSecretName})
-	return true
 }

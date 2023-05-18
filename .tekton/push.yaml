@@ -16,15 +16,17 @@ spec:
       value: 'quay.io/redhat-appstudio/build-service:{{revision}}'
     - name: infra-deployment-update-script
       value: |
-        sed -i -e 's|\(https://github.com/redhat-appstudio/build-service/config/default?ref=\)\(.*\)|\1{{ revision }}|' -e 's/\(newTag: \).*/\1{{ revision }}/' components/build/build-service/kustomization.yaml
+        sed -i -e 's|\(https://github.com/redhat-appstudio/build-service/.*?ref=\)\(.*\)|\1{{ revision }}|' -e 's/\(newTag: \).*/\1{{ revision }}/' components/build-service/base/kustomization.yaml
+        sed -i -e 's|\(https://github.com/redhat-appstudio/build-service/.*?ref=\)\(.*\)|\1{{ revision }}|' components/monitoring/grafana/base/build-service/kustomization.yaml
   pipelineRef:
     name: docker-build
-    bundle: quay.io/redhat-appstudio/hacbs-core-service-templates-bundle:latest
+    bundle: quay.io/redhat-appstudio-tekton-catalog/pipeline-core-services-docker-build:latest
   workspaces:
     - name: workspace
-      persistentVolumeClaim:
-        claimName: app-studio-default-workspace
-      subPath: build-service-push-{{ revision }}
-    - name: deploy-key
-      secret:
-        secretName: infra-deployments-deploy-key
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1Gi

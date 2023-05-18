@@ -1,0 +1,16 @@
+# See the OWNERS docs: https://git.k8s.io/community/contributors/guide/owners.md
+
+approvers:
+- mmorhun
+- psturc
+- Michkov
+
+reviewers:
+- mmorhun
+- psturc
+- Michkov
+
+# 'Build team' members that are not members of openshift github org (could be added in a future):
+# - brunoapimentel
+# - ejegrova
+# - stuartwdouglas
